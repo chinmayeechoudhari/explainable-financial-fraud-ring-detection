@@ -20,6 +20,12 @@ data/raw/*
 # Keep the folder itself in Git
 !data/raw/.gitkeep
 
+# Ignore all processed datasets
+data/processed/*
+
+# Keep the folder itself in Git
+!data/processed/.gitkeep
+
 # =========================
 # Jupyter
 # =========================
