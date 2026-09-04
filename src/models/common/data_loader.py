@@ -26,8 +26,8 @@ NUMERIC_FEATURES = [
     "Year",
     "Month",
     "Day",
-    "Hour",
     "DayOfWeek",
+    "Hour",
     "Transaction Time Category",
     "Is Weekend",
     "Log Amount Received",
@@ -43,9 +43,8 @@ CATEGORICAL_FEATURES = [
     "Payment Format",
 ]
 
-# Raw account/bank identifiers are retained for prediction output but are not
-# treated as ordered numeric inputs by the first tabular baseline.
 IDENTIFIER_COLUMNS = [
+    "Timestamp",
     "From Bank",
     "From Account",
     "To Bank",
@@ -82,16 +81,23 @@ def load_split(
     data_dir: Path | str = DEFAULT_DATA_DIR,
     columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Load one cleaned modeling split and validate its schema."""
+    """Load one cleaned modeling split and validate its full schema."""
     path = split_path(split, data_dir)
     if not path.exists():
         raise FileNotFoundError(
             f"Modeling split not found: {path}. Run the data pipeline first."
         )
 
-    df = pd.read_csv(path, usecols=columns)
-    validate_feature_contract(df.columns)
+    # Always validate the on-disk header before applying an optional column
+    # projection. This prevents a partial read from bypassing the contract.
+    header = pd.read_csv(path, nrows=0)
+    validate_feature_contract(header.columns)
 
+    usecols = columns
+    df = pd.read_csv(path, usecols=usecols)
+
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"{split}: target column is required")
     if df[TARGET_COLUMN].isna().any():
         raise ValueError(f"{split}: target contains missing values")
 
