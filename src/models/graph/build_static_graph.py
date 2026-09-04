@@ -1,9 +1,22 @@
 """Build a static, training-only graph for the first GNN baseline.
 
-This module deliberately does not modify Member A's exploratory graph. It builds
-an independent PyTorch Geometric-ready representation from the cleaned TRAIN
-transactions only. No validation/test/future rows are used for graph structure
-or node features.
+This module deliberately does not modify Member A's exploratory graph.
+It builds an independent PyTorch Geometric representation from the cleaned
+TRAIN transactions only.
+
+No validation/test/future rows are used for graph structure or node features.
+
+Node features:
+    1. in_degree
+    2. out_degree
+    3. total_degree
+    4. transaction_count
+    5. log_incoming_amount
+    6. log_outgoing_amount
+
+Target leakage protection:
+    - "Is Laundering" is never read.
+    - No target-derived graph statistics are created.
 """
 
 from __future__ import annotations
@@ -17,116 +30,320 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-TRAIN_PATH = PROJECT_ROOT / "data" / "processed" / "modeling_splits" / "train.csv"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "static_gnn"
 
-SOURCE_COLUMNS = [
-    "Timestamp",
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+TRAIN_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "modeling_splits"
+    / "train.csv"
+)
+
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "static_gnn"
+)
+
+REQUIRED_COLUMNS = [
     "From Bank",
     "From Account",
     "To Bank",
     "To Account",
     "Amount Received",
     "Amount Paid",
-    "Is Laundering",
 ]
 
 
-def node_key(bank, account) -> str:
-    return f"{bank}_{account}"
+def node_key(bank: pd.Series, account: pd.Series) -> pd.Series:
+    """Create a stable account identifier from bank + account."""
+
+    return (
+        bank.astype(str)
+        + "_"
+        + account.astype(str)
+    )
 
 
-def parse_timestamp(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, format="mixed", errors="coerce")
-
-
-def build_graph(train_path: Path, chunk_size: int) -> tuple[Data, dict]:
+def build_graph(
+    train_path: Path,
+    chunk_size: int,
+) -> tuple[Data, dict]:
     """Construct a sparse directed static graph using TRAIN only."""
-    required = [
-        "From Bank",
-        "From Account",
-        "To Bank",
-        "To Account",
-        "Amount Received",
-        "Amount Paid",
-        "Is Laundering",
-    ]
 
     node_to_id: dict[str, int] = {}
-    in_degree: dict[int, int] = {}
-    out_degree: dict[int, int] = {}
-    total_tx: dict[int, int] = {}
-    incoming_amount: dict[int, float] = {}
-    outgoing_amount: dict[int, float] = {}
+
+    # Dynamic NumPy arrays.
+    # These are expanded whenever a new node is discovered.
+    in_degree = np.zeros(0, dtype=np.int64)
+    out_degree = np.zeros(0, dtype=np.int64)
+    total_tx = np.zeros(0, dtype=np.int64)
+
+    incoming_amount = np.zeros(
+        0,
+        dtype=np.float64,
+    )
+
+    outgoing_amount = np.zeros(
+        0,
+        dtype=np.float64,
+    )
+
+    # Unique directed account relationships.
     pair_set: set[tuple[int, int]] = set()
-    positive_edge_pairs: set[tuple[int, int]] = set()
 
-    def get_id(bank, account) -> int:
-        key = node_key(bank, account)
-        if key not in node_to_id:
-            node_to_id[key] = len(node_to_id)
-        return node_to_id[key]
+    for chunk in pd.read_csv(
+        train_path,
+        usecols=REQUIRED_COLUMNS,
+        chunksize=chunk_size,
+    ):
+        src_keys = node_key(
+            chunk["From Bank"],
+            chunk["From Account"],
+        )
 
-    for chunk in pd.read_csv(train_path, usecols=required, chunksize=chunk_size):
-        amounts_in = chunk["Amount Received"].to_numpy(dtype=np.float64)
-        amounts_out = chunk["Amount Paid"].to_numpy(dtype=np.float64)
-        labels = chunk["Is Laundering"].to_numpy(dtype=np.int8)
+        dst_keys = node_key(
+            chunk["To Bank"],
+            chunk["To Account"],
+        )
 
-        for from_bank, from_account, to_bank, to_account, amount_in, amount_out, label in zip(
-            chunk["From Bank"].tolist(),
-            chunk["From Account"].tolist(),
-            chunk["To Bank"].tolist(),
-            chunk["To Account"].tolist(),
-            amounts_in,
-            amounts_out,
-            labels,
-        ):
-            src = get_id(from_bank, from_account)
-            dst = get_id(to_bank, to_account)
+        # ---------------------------------------------------------
+        # Assign IDs to newly observed nodes.
+        # ---------------------------------------------------------
 
-            out_degree[src] = out_degree.get(src, 0) + 1
-            in_degree[dst] = in_degree.get(dst, 0) + 1
-            total_tx[src] = total_tx.get(src, 0) + 1
-            total_tx[dst] = total_tx.get(dst, 0) + 1
-            outgoing_amount[src] = outgoing_amount.get(src, 0.0) + float(amount_out)
-            incoming_amount[dst] = incoming_amount.get(dst, 0.0) + float(amount_in)
-            pair = (src, dst)
-            pair_set.add(pair)
-            if int(label) == 1:
-                positive_edge_pairs.add(pair)
+        unique_keys = pd.unique(
+            pd.concat(
+                [
+                    src_keys,
+                    dst_keys,
+                ],
+                ignore_index=True,
+            )
+        )
 
-    edges = np.asarray(sorted(pair_set), dtype=np.int64)
-    if len(edges) == 0:
-        raise RuntimeError("Training graph contains no edges.")
-
-    num_nodes = len(node_to_id)
-    x = np.zeros((num_nodes, 6), dtype=np.float32)
-
-    for node_id in range(num_nodes):
-        x[node_id] = [
-            float(in_degree.get(node_id, 0)),
-            float(out_degree.get(node_id, 0)),
-            float(in_degree.get(node_id, 0) + out_degree.get(node_id, 0)),
-            float(total_tx.get(node_id, 0)),
-            float(np.log1p(incoming_amount.get(node_id, 0.0))),
-            float(np.log1p(outgoing_amount.get(node_id, 0.0))),
+        new_keys = [
+            str(key)
+            for key in unique_keys
+            if str(key) not in node_to_id
         ]
 
-    # Normalize node features using TRAIN graph statistics only.
-    mean = x.mean(axis=0)
-    std = x.std(axis=0)
-    std[std == 0] = 1.0
-    x = (x - mean) / std
+        if new_keys:
+            start_id = len(node_to_id)
 
-    edge_index = torch.tensor(edges.T, dtype=torch.long)
-    node_features = torch.tensor(x, dtype=torch.float32)
+            for offset, key in enumerate(new_keys):
+                node_to_id[key] = start_id + offset
+
+            new_size = len(node_to_id)
+
+            in_degree = np.pad(
+                in_degree,
+                (0, len(new_keys)),
+                mode="constant",
+            )
+
+            out_degree = np.pad(
+                out_degree,
+                (0, len(new_keys)),
+                mode="constant",
+            )
+
+            total_tx = np.pad(
+                total_tx,
+                (0, len(new_keys)),
+                mode="constant",
+            )
+
+            incoming_amount = np.pad(
+                incoming_amount,
+                (0, len(new_keys)),
+                mode="constant",
+            )
+
+            outgoing_amount = np.pad(
+                outgoing_amount,
+                (0, len(new_keys)),
+                mode="constant",
+            )
+
+            assert len(in_degree) == new_size
+
+        # ---------------------------------------------------------
+        # Convert account keys to integer node IDs.
+        # ---------------------------------------------------------
+
+        src_ids = src_keys.map(
+            node_to_id
+        ).to_numpy(
+            dtype=np.int64
+        )
+
+        dst_ids = dst_keys.map(
+            node_to_id
+        ).to_numpy(
+            dtype=np.int64
+        )
+
+        amount_in = chunk[
+            "Amount Received"
+        ].to_numpy(
+            dtype=np.float64
+        )
+
+        amount_out = chunk[
+            "Amount Paid"
+        ].to_numpy(
+            dtype=np.float64
+        )
+
+        # ---------------------------------------------------------
+        # Update node statistics.
+        #
+        # np.bincount is considerably faster than processing
+        # millions of transactions with Python dictionaries.
+        # ---------------------------------------------------------
+
+        in_counts = np.bincount(
+            dst_ids,
+            minlength=len(node_to_id),
+        )
+
+        out_counts = np.bincount(
+            src_ids,
+            minlength=len(node_to_id),
+        )
+
+        total_counts = (
+            in_counts
+            + out_counts
+        )
+
+        incoming_sums = np.bincount(
+            dst_ids,
+            weights=amount_in,
+            minlength=len(node_to_id),
+        )
+
+        outgoing_sums = np.bincount(
+            src_ids,
+            weights=amount_out,
+            minlength=len(node_to_id),
+        )
+
+        in_degree += in_counts
+        out_degree += out_counts
+        total_tx += total_counts
+
+        incoming_amount += incoming_sums
+        outgoing_amount += outgoing_sums
+
+        # ---------------------------------------------------------
+        # Add unique directed account relationships.
+        #
+        # Repeated transactions between the same accounts become
+        # one graph edge, matching the intended static graph
+        # definition.
+        # ---------------------------------------------------------
+
+        pair_set.update(
+            zip(
+                src_ids.tolist(),
+                dst_ids.tolist(),
+            )
+        )
+
+    # -------------------------------------------------------------
+    # Validate graph.
+    # -------------------------------------------------------------
+
+    if not pair_set:
+        raise RuntimeError(
+            "Training graph contains no edges."
+        )
+
+    num_nodes = len(node_to_id)
+
+    if num_nodes == 0:
+        raise RuntimeError(
+            "Training graph contains no nodes."
+        )
+
+    # -------------------------------------------------------------
+    # Construct node feature matrix.
+    # -------------------------------------------------------------
+
+    x = np.column_stack(
+        [
+            in_degree.astype(np.float32),
+            out_degree.astype(np.float32),
+            (
+                in_degree + out_degree
+            ).astype(np.float32),
+            total_tx.astype(np.float32),
+            np.log1p(
+                incoming_amount
+            ).astype(np.float32),
+            np.log1p(
+                outgoing_amount
+            ).astype(np.float32),
+        ]
+    )
+
+    # -------------------------------------------------------------
+    # Normalize using TRAIN graph statistics only.
+    # -------------------------------------------------------------
+
+    mean = x.mean(
+        axis=0,
+        dtype=np.float64,
+    )
+
+    std = x.std(
+        axis=0,
+        dtype=np.float64,
+    )
+
+    # Prevent division by zero for constant features.
+    std[std == 0] = 1.0
+
+    x = (
+        x - mean
+    ) / std
+
+    x = x.astype(
+        np.float32
+    )
+
+    # -------------------------------------------------------------
+    # Construct sparse directed edge index.
+    # -------------------------------------------------------------
+
+    edges = np.asarray(
+        sorted(pair_set),
+        dtype=np.int64,
+    )
+
+    edge_index = torch.tensor(
+        edges.T,
+        dtype=torch.long,
+    )
+
+    node_features = torch.tensor(
+        x,
+        dtype=torch.float32,
+    )
 
     data = Data(
         x=node_features,
         edge_index=edge_index,
         num_nodes=num_nodes,
     )
+
+    # -------------------------------------------------------------
+    # Metadata.
+    # -------------------------------------------------------------
 
     metadata = {
         "num_nodes": num_nodes,
@@ -142,53 +359,230 @@ def build_graph(train_path: Path, chunk_size: int) -> tuple[Data, dict]:
         ],
         "train_path": str(train_path),
         "train_only": True,
-        "positive_edge_pair_count": len(positive_edge_pairs),
+        "target_used_in_graph_construction": False,
+        "target_excluded_from_node_features": True,
         "feature_mean": mean.tolist(),
         "feature_std": std.tolist(),
-        "target_excluded_from_node_features": True,
+        "graph_type": "static_directed",
+        "repeated_transactions_aggregated_to_unique_edges": True,
     }
+
     return data, metadata
 
 
+def run_smoke_test() -> None:
+    """Run a bounded smoke test on the first 5,000 TRAIN rows."""
+
+    sample_path = (
+        OUTPUT_DIR
+        / "_smoke_train.csv"
+    )
+
+    smoke_columns = [
+        *REQUIRED_COLUMNS,
+        "Is Laundering",
+    ]
+
+    sample = pd.read_csv(
+        TRAIN_PATH,
+        usecols=smoke_columns,
+        nrows=5000,
+    )
+
+    sample.to_csv(
+        sample_path,
+        index=False,
+    )
+
+    try:
+        data, metadata = build_graph(
+            sample_path,
+            chunk_size=5000,
+        )
+    finally:
+        sample_path.unlink(
+            missing_ok=True
+        )
+
+    print(
+        f"Smoke-test nodes: "
+        f"{data.num_nodes}"
+    )
+
+    print(
+        f"Smoke-test edges: "
+        f"{data.edge_index.shape[1]}"
+    )
+
+    print(
+        f"Node feature shape: "
+        f"{tuple(data.x.shape)}"
+    )
+
+    print(
+        f"Edge index shape: "
+        f"{tuple(data.edge_index.shape)}"
+    )
+
+    print(
+        f"Contains NaN: "
+        f"{bool(torch.isnan(data.x).any())}"
+    )
+
+    print(
+        f"Contains Inf: "
+        f"{bool(torch.isinf(data.x).any())}"
+    )
+
+    print(
+        f"Train-only metadata: "
+        f"{metadata['train_only']}"
+    )
+
+    print(
+        f"Target used in construction: "
+        f"{metadata['target_used_in_graph_construction']}"
+    )
+
+    print(
+        f"Target excluded from node features: "
+        f"{metadata['target_excluded_from_node_features']}"
+    )
+
+    print(
+        "STATIC GRAPH SMOKE TEST: PASSED"
+    )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument("--chunk-size", type=int, default=100000)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build a static TRAIN-only graph "
+            "for the GCN baseline."
+        )
+    )
+
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a bounded 5,000-row smoke test.",
+    )
+
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=100000,
+        help="CSV chunk size for graph construction.",
+    )
+
     args = parser.parse_args()
 
     if not TRAIN_PATH.exists():
-        raise FileNotFoundError(f"Missing TRAIN split: {TRAIN_PATH}")
+        raise FileNotFoundError(
+            f"Missing TRAIN split: {TRAIN_PATH}"
+        )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if args.smoke_test:
-        # Build a bounded graph from an explicitly bounded temporary CSV read by
-        # creating a small in-memory fixture from the first chunk. This validates
-        # PyG tensor construction without generating the full graph artifact.
-        sample_path = OUTPUT_DIR / "_smoke_train.csv"
-        sample = pd.read_csv(TRAIN_PATH, usecols=SOURCE_COLUMNS, nrows=5000)
-        sample.to_csv(sample_path, index=False)
-        data, metadata = build_graph(sample_path, min(args.chunk_size, 5000))
-        sample_path.unlink(missing_ok=True)
-        print(f"Smoke-test nodes: {data.num_nodes}")
-        print(f"Smoke-test edges: {data.edge_index.shape[1]}")
-        print(f"Node feature shape: {tuple(data.x.shape)}")
-        print(f"Edge index shape: {tuple(data.edge_index.shape)}")
-        print(f"Contains NaN: {bool(torch.isnan(data.x).any())}")
-        print(f"Contains Inf: {bool(torch.isinf(data.x).any())}")
-        print(f"Train-only metadata: {metadata['train_only']}")
-        print("STATIC GRAPH SMOKE TEST: PASSED")
+        run_smoke_test()
         return
 
-    data, metadata = build_graph(TRAIN_PATH, args.chunk_size)
-    torch.save(data, OUTPUT_DIR / "train_graph.pt")
-    with (OUTPUT_DIR / "metadata.json").open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
+    # -------------------------------------------------------------
+    # Full TRAIN graph.
+    # -------------------------------------------------------------
 
-    print(f"Saved graph: {OUTPUT_DIR / 'train_graph.pt'}")
-    print(f"Nodes: {data.num_nodes:,}")
-    print(f"Edges: {data.edge_index.shape[1]:,}")
-    print("STATIC TRAIN GRAPH: COMPLETED")
+    print(
+        "Building static TRAIN graph..."
+    )
+
+    print(
+        f"TRAIN file: {TRAIN_PATH}"
+    )
+
+    print(
+        f"Chunk size: {args.chunk_size:,}"
+    )
+
+    data, metadata = build_graph(
+        TRAIN_PATH,
+        args.chunk_size,
+    )
+
+    graph_path = (
+        OUTPUT_DIR
+        / "train_graph.pt"
+    )
+
+    metadata_path = (
+        OUTPUT_DIR
+        / "metadata.json"
+    )
+
+    torch.save(
+        data,
+        graph_path,
+    )
+
+    with metadata_path.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            metadata,
+            handle,
+            indent=2,
+        )
+
+    print()
+    print(
+        f"Saved graph: {graph_path}"
+    )
+
+    print(
+        f"Saved metadata: {metadata_path}"
+    )
+
+    print(
+        f"Nodes: {data.num_nodes:,}"
+    )
+
+    print(
+        f"Edges: "
+        f"{data.edge_index.shape[1]:,}"
+    )
+
+    print(
+        f"Node features: "
+        f"{tuple(data.x.shape)}"
+    )
+
+    print(
+        f"Edge index: "
+        f"{tuple(data.edge_index.shape)}"
+    )
+
+    print(
+        f"Contains NaN: "
+        f"{bool(torch.isnan(data.x).any())}"
+    )
+
+    print(
+        f"Contains Inf: "
+        f"{bool(torch.isinf(data.x).any())}"
+    )
+
+    print(
+        "Target used in construction: "
+        f"{metadata['target_used_in_graph_construction']}"
+    )
+
+    print(
+        "STATIC TRAIN GRAPH: COMPLETED"
+    )
 
 
 if __name__ == "__main__":
