@@ -56,10 +56,15 @@ def build_encoder(train_path: Path, chunk_size: int) -> OneHotEncoder:
 
 
 def fit_scaler(train_path: Path, chunk_size: int) -> StandardScaler:
-    """Fit numeric scaling statistics from TRAIN only."""
+    """Fit numeric scaling statistics from TRAIN only.
+
+    Re-select NUMERIC_FEATURES after reading so the column order is identical
+    to the order used later by transform_chunk(). This avoids sklearn's feature
+    name/order validation rejecting an otherwise identical feature matrix.
+    """
     scaler = StandardScaler()
     for chunk in pd.read_csv(train_path, usecols=NUMERIC_FEATURES, chunksize=chunk_size):
-        values = chunk.astype(np.float64)
+        values = chunk[NUMERIC_FEATURES].astype(np.float64)
         if not np.isfinite(values.to_numpy()).all():
             raise ValueError("Training numeric features contain NaN or infinite values")
         scaler.partial_fit(values)
