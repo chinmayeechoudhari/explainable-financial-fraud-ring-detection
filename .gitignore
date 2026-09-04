@@ -47,5 +47,10 @@ data/processed/*
 .DS_Store
 Thumbs.db
 
+# =========================
+# Generated experiment outputs
+# =========================
+results/
+
 # Generated graph files
 data/graphs/*
