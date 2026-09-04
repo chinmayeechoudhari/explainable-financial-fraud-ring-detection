@@ -51,17 +51,27 @@ def build_encoder(train_path: Path, chunk_size: int) -> OneHotEncoder:
             categories[column].update(chunk[column].dropna().tolist())
 
     ordered = [sorted(values, key=lambda value: str(value)) for values in categories.values()]
+    if any(len(values) == 0 for values in ordered):
+        raise ValueError("At least one categorical feature has no training categories.")
+
+    # Explicit training-only categories prevent validation/test values from
+    # changing the fitted feature space. One representative row is sufficient
+    # because the category sets are supplied explicitly.
+    fit_row = pd.DataFrame(
+        [{column: values[0] for column, values in zip(CATEGORICAL_FEATURES, ordered)}]
+    )
     encoder = OneHotEncoder(
         categories=ordered,
         handle_unknown="ignore",
         sparse_output=True,
         dtype=np.float64,
     )
-    encoder.fit(pd.DataFrame({column: values for column, values in zip(CATEGORICAL_FEATURES, ordered)}))
+    encoder.fit(fit_row)
     return encoder
 
 
 def fit_scaler(train_path: Path, chunk_size: int) -> StandardScaler:
+    """Fit numeric scaling statistics using TRAIN only, in chunks."""
     scaler = StandardScaler()
     for chunk in pd.read_csv(train_path, usecols=NUMERIC_FEATURES, chunksize=chunk_size):
         scaler.partial_fit(chunk.astype(np.float64))
@@ -95,13 +105,15 @@ def train_model(
         shuffle=True,
     )
 
-    # Global balanced-class weights, computed from the complete training split.
     counts = {0: 0, 1: 0}
     for chunk in pd.read_csv(train_path, usecols=[TARGET_COLUMN], chunksize=config["chunk_size"]):
         counts[0] += int((chunk[TARGET_COLUMN] == 0).sum())
         counts[1] += int((chunk[TARGET_COLUMN] == 1).sum())
 
     total = counts[0] + counts[1]
+    if counts[0] == 0 or counts[1] == 0:
+        raise ValueError(f"Training split must contain both classes: {counts}")
+
     class_weights = {
         0: total / (2.0 * counts[0]),
         1: total / (2.0 * counts[1]),
@@ -117,8 +129,8 @@ def train_model(
         epoch_start = time.perf_counter()
         rows = 0
 
-        # Keep the chronological split intact. SGD's internal shuffle controls
-        # optimization order within each chunk and never moves rows between splits.
+        # The split itself remains chronological. SGD shuffles samples only
+        # inside each chunk for optimization; no row crosses a split boundary.
         for chunk in pd.read_csv(train_path, chunksize=config["chunk_size"]):
             y = chunk[TARGET_COLUMN].to_numpy(dtype=np.int8)
             X = transform_chunk(chunk, scaler, encoder)
@@ -158,7 +170,11 @@ def evaluate_split(
     score_all = []
 
     output_columns = ["Timestamp", "From Bank", "From Account", "To Bank", "To Account", TARGET_COLUMN]
-    for chunk in pd.read_csv(path, usecols=output_columns + NUMERIC_FEATURES + CATEGORICAL_FEATURES, chunksize=config["chunk_size"]):
+    for chunk in pd.read_csv(
+        path,
+        usecols=output_columns + NUMERIC_FEATURES + CATEGORICAL_FEATURES,
+        chunksize=config["chunk_size"],
+    ):
         y = chunk[TARGET_COLUMN].to_numpy(dtype=np.int8)
         X = transform_chunk(chunk, scaler, encoder)
         scores = classifier.predict_proba(X)[:, 1]
@@ -192,7 +208,11 @@ def evaluate_split(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke-test", action="store_true", help="Load and transform only a small training chunk.")
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Fit preprocessing on TRAIN and transform one small chunk; do not train.",
+    )
     args = parser.parse_args()
 
     config = load_config()
