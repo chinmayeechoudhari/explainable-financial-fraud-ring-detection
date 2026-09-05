@@ -1,9 +1,7 @@
 """Controlled TGAT learning sanity experiment.
 
-This is not a benchmark. It selects a chronological query subset with enough
-positive examples to make PR-AUC meaningful, while preserving the existing
-TGAT neighbor construction and strict historical ordering. Official temporal
-GNN datasets and the main training script are not modified.
+Run from the repository root with ``python -m scripts.tgat_sanity``. The
+experiment does not modify the official temporal GNN datasets or main trainer.
 """
 from __future__ import annotations
 
@@ -40,13 +38,11 @@ def select_queries(frame: pd.DataFrame, positives: int, negatives: int, seed: in
     pos = frame[frame["Is Laundering"] == 1]
     neg = frame[frame["Is Laundering"] == 0]
     if len(pos) < positives or len(neg) < negatives:
-        raise RuntimeError(
-            f"Not enough rows: positives={len(pos)}, negatives={len(neg)}; "
-            f"requested {positives}/{negatives}"
-        )
-    pos_idx = rng.choice(len(pos), size=positives, replace=False)
-    neg_idx = rng.choice(len(neg), size=negatives, replace=False)
-    selected = pd.concat([pos.iloc[pos_idx], neg.iloc[neg_idx]], ignore_index=True)
+        raise RuntimeError(f"Not enough rows: positives={len(pos)}, negatives={len(neg)}")
+    selected = pd.concat([
+        pos.iloc[rng.choice(len(pos), size=positives, replace=False)],
+        neg.iloc[rng.choice(len(neg), size=negatives, replace=False)],
+    ], ignore_index=True)
     return selected.sort_values("_timestamp", kind="stable").reset_index(drop=True)
 
 
@@ -69,15 +65,13 @@ def run_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_k,
     model.train()
     losses = []
     for batch in make_batches(frame, store, batch_size, neighbor_k):
-        transaction = batch.transaction_features.to(device)
-        sender = batch.sender_features.to(device)
-        sender_delta = batch.sender_delta_seconds.to(device)
-        receiver = batch.receiver_features.to(device)
-        receiver_delta = batch.receiver_delta_seconds.to(device)
-        labels = batch.labels.to(device)
         optimizer.zero_grad(set_to_none=True)
-        logits, _ = model(transaction, sender, sender_delta, receiver, receiver_delta)
-        loss = criterion(logits, labels)
+        logits, _ = model(
+            batch.transaction_features.to(device), batch.sender_features.to(device),
+            batch.sender_delta_seconds.to(device), batch.receiver_features.to(device),
+            batch.receiver_delta_seconds.to(device),
+        )
+        loss = criterion(logits, batch.labels.to(device))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
@@ -91,10 +85,8 @@ def predict(model, frame, store, batch_size, neighbor_k, device):
     with torch.no_grad():
         for batch in make_batches(frame, store, batch_size, neighbor_k):
             logits, _ = model(
-                batch.transaction_features.to(device),
-                batch.sender_features.to(device),
-                batch.sender_delta_seconds.to(device),
-                batch.receiver_features.to(device),
+                batch.transaction_features.to(device), batch.sender_features.to(device),
+                batch.sender_delta_seconds.to(device), batch.receiver_features.to(device),
                 batch.receiver_delta_seconds.to(device),
             )
             scores.extend(torch.sigmoid(logits).cpu().numpy())
@@ -137,7 +129,6 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Train queries: {len(train)} ({int(train['Is Laundering'].sum())} positive, {int((train['Is Laundering'] == 0).sum())} negative)")
     print(f"Validation queries: {len(validation)} ({int(validation['Is Laundering'].sum())} positive, {int((validation['Is Laundering'] == 0).sum())} negative)")
-    print(f"Source windows: train={len(train_source)}, validation={len(val_source)}")
 
     best_pr = -np.inf
     best_state = None
@@ -157,8 +148,7 @@ def main() -> None:
         raise RuntimeError("No sanity checkpoint produced")
     model.load_state_dict(best_state)
     labels, scores = predict(model, validation, EventFeatureStore(max_history=args.neighbor_k), args.batch_size, args.neighbor_k, device)
-    pos_scores = scores[labels == 1]
-    neg_scores = scores[labels == 0]
+    pos_scores, neg_scores = scores[labels == 1], scores[labels == 0]
     print(f"Best validation PR-AUC: {average_precision_score(labels, scores):.6f}")
     print(f"Best validation ROC-AUC: {roc_auc_score(labels, scores):.6f}")
     print(f"Positive score mean: {pos_scores.mean():.6f}")
