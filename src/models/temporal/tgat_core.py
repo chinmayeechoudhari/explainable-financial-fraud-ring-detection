@@ -1,9 +1,4 @@
-"""Core TGAT components for leakage-safe temporal transaction modeling.
-
-The model operates on account nodes and timestamped historical interactions.
-For a query transaction at time T, callers must provide only events with
- event_timestamp < T. The core itself does not query future data.
-"""
+"""Core TGAT components for leakage-safe temporal transaction modeling."""
 from __future__ import annotations
 
 import math
@@ -37,7 +32,7 @@ class TimeEncoder(nn.Module):
 
 
 class TemporalAttentionLayer(nn.Module):
-    """Single multi-head temporal attention layer."""
+    """Multi-head attention over strictly historical temporal neighbors."""
 
     def __init__(
         self,
@@ -52,7 +47,6 @@ class TemporalAttentionLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-
         self.query = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.key = nn.Linear(hidden_dim + time_dim, hidden_dim, bias=False)
         self.value = nn.Linear(hidden_dim + time_dim, hidden_dim, bias=False)
@@ -72,6 +66,10 @@ class TemporalAttentionLayer(nn.Module):
         query_state: [B, H]
         neighbor_states: [B, K, H]
         delta_seconds: [B, K]
+
+        A non-positive delta denotes padding. Padding receives exactly zero
+        attention, which prevents artificial neighbors from affecting the
+        representation.
         """
         if neighbor_states.dim() != 3:
             raise ValueError("neighbor_states must have shape [B, K, H]")
@@ -79,14 +77,13 @@ class TemporalAttentionLayer(nn.Module):
             raise ValueError("delta_seconds shape must match [B, K]")
 
         batch_size, neighbor_count, _ = neighbor_states.shape
-        time_features = time_encoder(
-            delta_seconds.reshape(-1)
-        ).reshape(batch_size, neighbor_count, -1)
+        valid = delta_seconds > 0
+        time_features = time_encoder(delta_seconds.reshape(-1)).reshape(
+            batch_size, neighbor_count, -1
+        )
         combined = torch.cat([neighbor_states, time_features], dim=-1)
 
-        q = self.query(query_state).view(
-            batch_size, self.num_heads, self.head_dim
-        )
+        q = self.query(query_state).view(batch_size, self.num_heads, self.head_dim)
         k = self.key(combined).view(
             batch_size, neighbor_count, self.num_heads, self.head_dim
         ).transpose(1, 2)
@@ -94,23 +91,24 @@ class TemporalAttentionLayer(nn.Module):
             batch_size, neighbor_count, self.num_heads, self.head_dim
         ).transpose(1, 2)
 
-        logits = (
-            q.unsqueeze(2) * k
-        ).sum(dim=-1) / math.sqrt(self.head_dim)
+        logits = (q.unsqueeze(2) * k).sum(dim=-1) / math.sqrt(self.head_dim)
+        logits = logits.masked_fill(~valid.unsqueeze(1), torch.finfo(logits.dtype).min)
         weights = torch.softmax(logits, dim=-1)
+        weights = weights * valid.unsqueeze(1).to(weights.dtype)
+        normalizer = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        weights = weights / normalizer
+
         attended = (weights.unsqueeze(-1) * v).sum(dim=2)
         attended = attended.reshape(batch_size, self.hidden_dim)
+        result = self.norm(query_state + self.dropout(self.output(attended)))
 
-        result = self.norm(
-            query_state + self.dropout(self.output(attended))
-        )
         if return_attention:
             return result, weights.mean(dim=1)
         return result, None
 
 
 class TGATTransactionModel(nn.Module):
-    """Two-layer TGAT-style encoder with transaction-level classifier."""
+    """Two-layer TGAT-style account encoder with transaction classifier."""
 
     def __init__(
         self,
@@ -127,21 +125,14 @@ class TGATTransactionModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.time_dim = time_dim
         self.num_heads = num_heads
-
         self.node_encoder = nn.Sequential(
             nn.Linear(event_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-
         self.time_encoder = TimeEncoder(time_dim)
-        self.attn1 = TemporalAttentionLayer(
-            hidden_dim, time_dim, num_heads, dropout
-        )
-        self.attn2 = TemporalAttentionLayer(
-            hidden_dim, time_dim, num_heads, dropout
-        )
-
+        self.attn1 = TemporalAttentionLayer(hidden_dim, time_dim, num_heads, dropout)
+        self.attn2 = TemporalAttentionLayer(hidden_dim, time_dim, num_heads, dropout)
         self.transaction_encoder = nn.Sequential(
             nn.Linear(hidden_dim * 2 + transaction_dim, hidden_dim),
             nn.ReLU(),
@@ -161,18 +152,10 @@ class TGATTransactionModel(nn.Module):
         query = self.node_encoder(query_features)
         neighbors = self.node_encoder(neighbor_features)
         query, attn1 = self.attn1(
-            query,
-            neighbors,
-            delta_seconds,
-            self.time_encoder,
-            return_attention,
+            query, neighbors, delta_seconds, self.time_encoder, return_attention
         )
         query, attn2 = self.attn2(
-            query,
-            neighbors,
-            delta_seconds,
-            self.time_encoder,
-            return_attention,
+            query, neighbors, delta_seconds, self.time_encoder, return_attention
         )
         if return_attention:
             return query, [attn1, attn2]
@@ -187,32 +170,19 @@ class TGATTransactionModel(nn.Module):
         receiver_delta_seconds: Tensor,
         return_attention: bool = False,
     ) -> tuple[Tensor, Optional[dict[str, list[Tensor]]]]:
-        """Return logits and optional attention weights."""
-        sender_query = sender_features[:, 0, :]
-        receiver_query = receiver_features[:, 0, :]
-        sender_neighbors = sender_features[:, 1:, :]
-        receiver_neighbors = receiver_features[:, 1:, :]
-
         sender_embedding, sender_attention = self.encode_account(
-            sender_query,
-            sender_neighbors,
-            sender_delta_seconds,
-            return_attention,
+            sender_features[:, 0, :], sender_features[:, 1:, :],
+            sender_delta_seconds, return_attention
         )
         receiver_embedding, receiver_attention = self.encode_account(
-            receiver_query,
-            receiver_neighbors,
-            receiver_delta_seconds,
-            return_attention,
+            receiver_features[:, 0, :], receiver_features[:, 1:, :],
+            receiver_delta_seconds, return_attention
         )
-
         combined = torch.cat(
-            [sender_embedding, receiver_embedding, transaction_features],
-            dim=-1,
+            [sender_embedding, receiver_embedding, transaction_features], dim=-1
         )
         representation = self.transaction_encoder(combined)
         logits = self.classifier(representation).squeeze(-1)
-
         if return_attention:
             return logits, {
                 "sender": sender_attention or [],
