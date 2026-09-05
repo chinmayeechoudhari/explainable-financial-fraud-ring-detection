@@ -1,0 +1,28 @@
+{
+  "model": {
+    "transaction_dim": 27,
+    "event_dim": 27,
+    "hidden_dim": 32,
+    "time_dim": 16,
+    "num_heads": 2,
+    "dropout": 0.2,
+    "neighbor_k": 10
+  },
+  "training": {
+    "epochs": 3,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "negative_sampling_ratio": 20,
+    "seed": 42,
+    "threshold": 0.5
+  },
+  "data": {
+    "directory": "data/processed/temporal_gnn",
+    "train": "train.csv",
+    "validation": "validation.csv",
+    "test": "test.csv",
+    "future": "future.csv"
+  },
+  "results": "results/tgat"
+}
