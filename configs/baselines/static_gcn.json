@@ -1,0 +1,13 @@
+{
+  "model": "StaticGCN",
+  "input_dim": 6,
+  "hidden_dim": 32,
+  "embedding_dim": 16,
+  "dropout": 0.2,
+  "learning_rate": 0.001,
+  "epochs": 10,
+  "seed": 42,
+  "graph": "TRAIN-only static account graph",
+  "target": "Is Laundering",
+  "threshold": 0.5
+}

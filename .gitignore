@@ -1,0 +1,56 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# =========================
+# Dataset
+# =========================
+
+# Ignore all raw datasets
+data/raw/*
+
+# Keep the folder itself in Git
+!data/raw/.gitkeep
+
+# Ignore all processed datasets
+data/processed/*
+
+# Keep the folder itself in Git
+!data/processed/.gitkeep
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+
+# =========================
+# Environment variables
+# =========================
+.env
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Generated experiment outputs
+# =========================
+results/
+
+# Generated graph files
+data/graphs/*
