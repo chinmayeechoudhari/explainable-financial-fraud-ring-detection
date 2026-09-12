@@ -23,7 +23,6 @@ from src.models.temporal.feature_scaler import TemporalFeatureScaler
 from src.models.temporal.tgat_core import TGATTransactionModel
 from src.models.temporal.tgat_dataset import ALL_FEATURES, CURRENT_FEATURES, TARGET, EventFeatureStore, build_batch
 
-
 DEFAULT_DATA = Path("data/processed/temporal_gnn")
 DEFAULT_RESULTS = Path("results/tgat")
 
@@ -41,7 +40,7 @@ def read_frame(path: Path, rows: int | None = None) -> pd.DataFrame:
     return frame
 
 
-def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, neighbor_k: int, feature_scaler=None):
+def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, neighbor_k: int):
     """Yield causal batches and update history only after each timestamp-safe batch."""
     start = 0
     columns = list(frame.columns)
@@ -57,20 +56,23 @@ def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int,
             while end < len(frame) and frame.iloc[end]["_timestamp"] == timestamp:
                 end += 1
         chunk = frame.iloc[start:end]
-        yield build_batch(chunk, store, neighbor_k, feature_scaler=feature_scaler)
+        # Frames are already transformed by the train-only scaler. Passing the
+        # scaler again here would double-transform query features while stored
+        # event features remain single-transformed.
+        yield build_batch(chunk, store, neighbor_k, feature_scaler=None)
         for row in chunk.itertuples(index=False, name=None):
             store.add_row(row, int(row[timestamp_idx]), feature_indices=(source_idx, destination_idx, *feature_indices))
         start = end
 
 
-def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_k, negative_ratio, device, feature_scaler):
+def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_k, negative_ratio, device):
     model.train()
     total_loss = 0.0
     used = 0
     positives = 0
     negatives = 0
     total_batches = 0
-    for batch in make_batches(frame, store, batch_size, neighbor_k, feature_scaler):
+    for batch in make_batches(frame, store, batch_size, neighbor_k):
         total_batches += 1
         labels = batch.labels
         positive_idx = torch.nonzero(labels == 1, as_tuple=False).flatten()
@@ -107,13 +109,13 @@ def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_
     return total_loss / max(used, 1), positives, negatives, total_batches
 
 
-def predict(model, frame, store, batch_size, neighbor_k, device, feature_scaler=None):
+def predict(model, frame, store, batch_size, neighbor_k, device):
     model.eval()
     scores = []
     labels = []
     timestamps = []
     with torch.no_grad():
-        for batch in make_batches(frame, store, batch_size, neighbor_k, feature_scaler):
+        for batch in make_batches(frame, store, batch_size, neighbor_k):
             output = model(
                 batch.transaction_features.to(device),
                 batch.sender_features.to(device),
@@ -163,8 +165,9 @@ def main() -> None:
     if not set(train[TARGET].dropna().unique()).issubset({0, 1}):
         raise RuntimeError("Invalid target labels")
 
-    # Fit statistics on training data only. Validation/test are transformed
-    # with exactly the same scaler; no future information enters the scaler.
+    # Fit statistics on training data only. Transform each split once and keep
+    # both query features and stored historical event features in that same
+    # scaled space. No future information enters the scaler.
     print("Fitting train-only feature scaler...", flush=True)
     scaler = TemporalFeatureScaler.fit(train)
     train = scaler.transform_frame(train)
@@ -204,11 +207,11 @@ def main() -> None:
         print(f"\nEpoch {epoch}/{args.epochs} - training...", flush=True)
         loss, positives, negatives, batches = train_epoch(
             model, train, store, optimizer, criterion,
-            args.batch_size, args.neighbor_k, args.negative_ratio, device, scaler,
+            args.batch_size, args.neighbor_k, args.negative_ratio, device,
         )
         print(f"Epoch {epoch}/{args.epochs} - validating...", flush=True)
         val_labels, val_scores, _ = predict(
-            model, validation, store, args.batch_size, args.neighbor_k, device, scaler
+            model, validation, store, args.batch_size, args.neighbor_k, device
         )
         val_pr = average_precision_score(val_labels, val_scores)
         row = {
@@ -238,14 +241,14 @@ def main() -> None:
 
     print("\nRebuilding train history for final validation/test evaluation...", flush=True)
     evaluation_store = EventFeatureStore(max_history=args.neighbor_k)
-    _, _, _ = predict(model, train, evaluation_store, args.batch_size, args.neighbor_k, device, scaler)
+    _, _, _ = predict(model, train, evaluation_store, args.batch_size, args.neighbor_k, device)
     print("Evaluating validation...", flush=True)
     val_labels, val_scores, val_ts = predict(
-        model, validation, evaluation_store, args.batch_size, args.neighbor_k, device, scaler
+        model, validation, evaluation_store, args.batch_size, args.neighbor_k, device
     )
     print("Evaluating test...", flush=True)
     test_labels, test_scores, test_ts = predict(
-        model, test, evaluation_store, args.batch_size, args.neighbor_k, device, scaler
+        model, test, evaluation_store, args.batch_size, args.neighbor_k, device
     )
 
     metrics = {
