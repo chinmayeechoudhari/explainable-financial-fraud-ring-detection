@@ -7,7 +7,7 @@ before any event from that group is inserted into the temporal store.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -54,11 +54,13 @@ class EventFeatureStore:
             self.account_to_id[account] = len(self.account_to_id)
         return self.account_to_id[account]
 
-    def add_row(self, row: Mapping[str, object], timestamp: int) -> None:
-        """Insert one event using a mapping; avoids pandas Series iteration overhead."""
-        source = self.get_id(str(row["From Account"]))
-        destination = self.get_id(str(row["To Account"]))
-        features = np.asarray([row[name] for name in ALL_FEATURES], dtype=np.float32)
+    def add_row(self, row, timestamp: int, feature_indices: tuple[int, ...]) -> None:
+        """Insert one itertuples row without constructing a pandas Series/dict."""
+        source = self.get_id(str(row[feature_indices[0]]))
+        destination = self.get_id(str(row[feature_indices[1]]))
+        features = np.asarray(
+            [row[index] for index in feature_indices[2:]], dtype=np.float32
+        )
         self.store.add_event(timestamp, source, destination, features)
 
     def history(self, node_id: int, timestamp: int, limit: int) -> list[tuple[int, np.ndarray]]:
@@ -80,14 +82,16 @@ def _pad_history(events: Iterable[tuple[int, np.ndarray]], k: int, feature_dim: 
     return feature_array, delta_array
 
 
-def _row_value(row: tuple, name_to_index: dict[str, int], name: str):
-    return row[name_to_index[name]]
-
-
-def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int = 10) -> TemporalBatch:
-    """Build a causal batch using itertuples instead of pandas iterrows."""
+def build_batch(
+    frame: pd.DataFrame,
+    store: EventFeatureStore,
+    neighbor_k: int = 10,
+    feature_scaler=None,
+) -> TemporalBatch:
+    """Build a causal batch using tuple-based row access."""
     columns = list(frame.columns)
     idx = {name: pos for pos, name in enumerate(columns)}
+    feature_indices = tuple(idx[name] for name in ALL_FEATURES)
     transaction_features = []
     sender_features = []
     sender_delta = []
@@ -97,21 +101,26 @@ def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int =
     timestamps = []
 
     for row in frame.itertuples(index=False, name=None):
-        timestamp = int(_row_value(row, idx, "_timestamp"))
-        sender = store.get_id(str(_row_value(row, idx, "From Account")))
-        receiver = store.get_id(str(_row_value(row, idx, "To Account")))
+        timestamp = int(row[idx["_timestamp"]])
+        sender = store.get_id(str(row[idx["From Account"]]))
+        receiver = store.get_id(str(row[idx["To Account"]]))
         sender_history = store.history(sender, timestamp, neighbor_k)
         receiver_history = store.history(receiver, timestamp, neighbor_k)
 
         sender_events, sender_times = _pad_history(sender_history, neighbor_k, len(ALL_FEATURES), timestamp)
         receiver_events, receiver_times = _pad_history(receiver_history, neighbor_k, len(ALL_FEATURES), timestamp)
 
-        transaction_features.append(np.asarray([_row_value(row, idx, name) for name in ALL_FEATURES], dtype=np.float32))
+        transaction = np.asarray([row[index] for index in feature_indices], dtype=np.float64)
+        if feature_scaler is not None:
+            transaction = feature_scaler.transform_array(transaction)
+        else:
+            transaction = transaction.astype(np.float32)
+        transaction_features.append(transaction)
         sender_features.append(np.vstack([np.zeros(len(ALL_FEATURES), dtype=np.float32), sender_events]))
         receiver_features.append(np.vstack([np.zeros(len(ALL_FEATURES), dtype=np.float32), receiver_events]))
         sender_delta.append(sender_times)
         receiver_delta.append(receiver_times)
-        labels.append(int(_row_value(row, idx, TARGET)))
+        labels.append(int(row[idx[TARGET]]))
         timestamps.append(timestamp)
 
     return TemporalBatch(
