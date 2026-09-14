@@ -40,15 +40,40 @@ def read_frame(path: Path, rows: int | None = None) -> pd.DataFrame:
     return frame
 
 
+def _row_layout(frame: pd.DataFrame) -> tuple[int, int, int, tuple[int, ...]]:
+    """Cache the positional layout used by chronological row processing."""
+    columns = list(frame.columns)
+    idx = {name: pos for pos, name in enumerate(columns)}
+    return (
+        idx["From Account"],
+        idx["To Account"],
+        idx["_timestamp"],
+        tuple(idx[name] for name in ALL_FEATURES),
+    )
+
+
+def _add_chunk_to_store(
+    chunk: pd.DataFrame,
+    store: EventFeatureStore,
+    source_idx: int,
+    destination_idx: int,
+    timestamp_idx: int,
+    feature_indices: tuple[int, ...],
+) -> None:
+    """Insert a chronological chunk into history without model inference."""
+    store_feature_indices = (source_idx, destination_idx, *feature_indices)
+    for row in chunk.itertuples(index=False, name=None):
+        store.add_row(
+            row,
+            int(row[timestamp_idx]),
+            feature_indices=store_feature_indices,
+        )
+
+
 def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, neighbor_k: int):
     """Yield causal batches and update history only after each timestamp-safe batch."""
     start = 0
-    columns = list(frame.columns)
-    idx = {name: pos for pos, name in enumerate(columns)}
-    feature_indices = tuple(idx[name] for name in ALL_FEATURES)
-    source_idx = idx["From Account"]
-    destination_idx = idx["To Account"]
-    timestamp_idx = idx["_timestamp"]
+    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame)
     while start < len(frame):
         end = min(start + batch_size, len(frame))
         if end < len(frame):
@@ -60,9 +85,37 @@ def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int,
         # scaler again here would double-transform query features while stored
         # event features remain single-transformed.
         yield build_batch(chunk, store, neighbor_k, feature_scaler=None)
-        for row in chunk.itertuples(index=False, name=None):
-            store.add_row(row, int(row[timestamp_idx]), feature_indices=(source_idx, destination_idx, *feature_indices))
+        _add_chunk_to_store(
+            chunk, store, source_idx, destination_idx, timestamp_idx, feature_indices
+        )
         start = end
+
+
+def populate_history(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int) -> int:
+    """Rebuild causal history without running the TGAT model.
+
+    The previous final-evaluation path called ``predict(train, ...)`` only to
+    populate the temporal store. That unnecessarily performed a full forward
+    pass over every training transaction. This helper preserves the exact
+    timestamp-safe insertion order while avoiding model inference, tensor
+    construction, and score generation for the training split.
+    """
+    start = 0
+    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame)
+    batches = 0
+    while start < len(frame):
+        end = min(start + batch_size, len(frame))
+        if end < len(frame):
+            timestamp = frame.iloc[end - 1]["_timestamp"]
+            while end < len(frame) and frame.iloc[end]["_timestamp"] == timestamp:
+                end += 1
+        chunk = frame.iloc[start:end]
+        _add_chunk_to_store(
+            chunk, store, source_idx, destination_idx, timestamp_idx, feature_indices
+        )
+        batches += 1
+        start = end
+    return batches
 
 
 def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_k, negative_ratio, device):
@@ -241,7 +294,13 @@ def main() -> None:
 
     print("\nRebuilding train history for final validation/test evaluation...", flush=True)
     evaluation_store = EventFeatureStore(max_history=args.neighbor_k)
-    _, _, _ = predict(model, train, evaluation_store, args.batch_size, args.neighbor_k, device)
+    history_start = time.time()
+    history_batches = populate_history(train, evaluation_store, args.batch_size)
+    print(
+        f"Train history rebuilt: {len(train):,} rows, "
+        f"{history_batches} batches, time={time.time() - history_start:.1f}s",
+        flush=True,
+    )
     print("Evaluating validation...", flush=True)
     val_labels, val_scores, val_ts = predict(
         model, validation, evaluation_store, args.batch_size, args.neighbor_k, device
