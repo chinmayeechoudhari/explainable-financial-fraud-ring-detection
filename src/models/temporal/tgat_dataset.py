@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .temporal_neighbor_store import TemporalNeighborStore
+from .temporal_neighbor_store import TemporalEvent, TemporalNeighborStore
 
 CURRENT_FEATURES = [
     "Amount Received", "Amount Paid", "Amount Difference", "Amount Ratio",
@@ -60,19 +60,25 @@ class EventFeatureStore:
             (row[index] for index in feature_indices[2:]),
         )
 
-    def history(self, node_id: int, timestamp: int, limit: int) -> list[tuple[int, np.ndarray]]:
-        events = self.store.recent_events(node_id, timestamp, limit)
-        return [(event.timestamp, np.asarray(event.features, dtype=np.float32)) for event in events]
+    def history(self, node_id: int, timestamp: int, limit: int) -> list[TemporalEvent]:
+        """Return historical events without allocating NumPy arrays per event."""
+        return self.store.recent_events(node_id, timestamp, limit)
 
 
-def _pad_history(events: Iterable[tuple[int, np.ndarray]], k: int, feature_dim: int, query_timestamp: int) -> tuple[np.ndarray, np.ndarray]:
+def _pad_history(
+    events: Iterable[TemporalEvent],
+    k: int,
+    feature_dim: int,
+    query_timestamp: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pack event tuples directly into preallocated arrays."""
     feature_array = np.zeros((k, feature_dim), dtype=np.float32)
     delta_array = np.zeros(k, dtype=np.float32)
-    for index, (timestamp, features) in enumerate(events):
+    for index, event in enumerate(events):
         if index >= k:
             break
-        feature_array[index] = features
-        delta = int(query_timestamp) - int(timestamp)
+        feature_array[index] = event.features
+        delta = int(query_timestamp) - int(event.timestamp)
         if delta <= 0:
             raise ValueError("Temporal sampler returned a non-historical event")
         delta_array[index] = float(delta)
