@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 
 class TimeEncoder(nn.Module):
@@ -92,34 +91,19 @@ class TemporalAttentionLayer(nn.Module):
             batch_size, neighbor_count, self.num_heads, self.head_dim
         ).transpose(1, 2)
 
-        if not return_attention:
-            # PyTorch's scaled-dot-product attention uses optimized CPU
-            # kernels and avoids materializing the [B, heads, K] logits and
-            # softmax tensors separately. The boolean mask preserves the
-            # strict historical-neighbor rule used by the reference path.
-            q_sdpa = q.unsqueeze(2)
-            attention_mask = valid.unsqueeze(1).unsqueeze(1)
-            attended = F.scaled_dot_product_attention(
-                q_sdpa,
-                k,
-                v,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-            ).squeeze(2)
-        else:
-            logits = (q.unsqueeze(2) * k).sum(dim=-1) / math.sqrt(self.head_dim)
-            logits = logits.masked_fill(~valid.unsqueeze(1), torch.finfo(logits.dtype).min)
-            weights = torch.softmax(logits, dim=-1)
-            weights = weights * valid.unsqueeze(1).to(weights.dtype)
-            normalizer = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            weights = weights / normalizer
-            attended = (weights.unsqueeze(-1) * v).sum(dim=2)
-            attended = attended.reshape(batch_size, self.hidden_dim)
-            result = self.norm(query_state + self.dropout(self.output(attended)))
-            return result, weights.mean(dim=1)
+        logits = (q.unsqueeze(2) * k).sum(dim=-1) / math.sqrt(self.head_dim)
+        logits = logits.masked_fill(~valid.unsqueeze(1), torch.finfo(logits.dtype).min)
+        weights = torch.softmax(logits, dim=-1)
+        weights = weights * valid.unsqueeze(1).to(weights.dtype)
+        normalizer = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        weights = weights / normalizer
 
+        attended = (weights.unsqueeze(-1) * v).sum(dim=2)
         attended = attended.reshape(batch_size, self.hidden_dim)
         result = self.norm(query_state + self.dropout(self.output(attended)))
+
+        if return_attention:
+            return result, weights.mean(dim=1)
         return result, None
 
 
