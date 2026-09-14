@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .temporal_neighbor_store import TemporalEvent, TemporalNeighborStore
+from .temporal_neighbor_store import TemporalNeighborStore
 
 CURRENT_FEATURES = [
     "Amount Received", "Amount Paid", "Amount Difference", "Amount Ratio",
@@ -60,77 +60,68 @@ class EventFeatureStore:
             (row[index] for index in feature_indices[2:]),
         )
 
-    def history(self, node_id: int, timestamp: int, limit: int) -> list[TemporalEvent]:
-        """Return recent historical events."""
-        return self.store.recent_events(node_id, timestamp, limit)
+    def history(self, node_id: int, timestamp: int, limit: int) -> list[tuple[int, np.ndarray]]:
+        events = self.store.recent_events(node_id, timestamp, limit)
+        return [(event.timestamp, np.asarray(event.features, dtype=np.float32)) for event in events]
 
 
-def _pad_history(
-    events: Iterable[TemporalEvent],
-    feature_array: np.ndarray,
-    delta_array: np.ndarray,
-    query_timestamp: int,
-) -> None:
-    """Write a historical neighborhood directly into preallocated arrays."""
-    for index, event in enumerate(events):
-        if index >= len(delta_array):
+def _pad_history(events: Iterable[tuple[int, np.ndarray]], k: int, feature_dim: int, query_timestamp: int) -> tuple[np.ndarray, np.ndarray]:
+    feature_array = np.zeros((k, feature_dim), dtype=np.float32)
+    delta_array = np.zeros(k, dtype=np.float32)
+    for index, (timestamp, features) in enumerate(events):
+        if index >= k:
             break
-        feature_array[index] = event.features
-        delta = int(query_timestamp) - int(event.timestamp)
+        feature_array[index] = features
+        delta = int(query_timestamp) - int(timestamp)
         if delta <= 0:
             raise ValueError("Temporal sampler returned a non-historical event")
         delta_array[index] = float(delta)
+    return feature_array, delta_array
 
 
 def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int = 10, feature_scaler=None) -> TemporalBatch:
-    """Build a causal batch with preallocated NumPy output buffers."""
+    """Build a causal batch using tuple-based row access."""
     columns = list(frame.columns)
     idx = {name: pos for pos, name in enumerate(columns)}
+    feature_indices = tuple(idx[name] for name in ALL_FEATURES)
     sender_index = idx["From Account"]
     receiver_index = idx["To Account"]
     timestamp_index = idx["_timestamp"]
-    row_count = len(frame)
-    feature_dim = len(ALL_FEATURES)
+    target_index = idx[TARGET]
+    transaction_features, sender_features, sender_delta = [], [], []
+    receiver_features, receiver_delta, labels, timestamps = [], [], [], []
 
-    if feature_scaler is None:
-        transaction_matrix = frame[ALL_FEATURES].to_numpy(dtype=np.float32, copy=False)
-    else:
-        transaction_matrix = feature_scaler.transform_array(
-            frame[ALL_FEATURES].to_numpy(dtype=np.float64)
-        )
-
-    sender_features = np.zeros((row_count, neighbor_k + 1, feature_dim), dtype=np.float32)
-    receiver_features = np.zeros((row_count, neighbor_k + 1, feature_dim), dtype=np.float32)
-    sender_delta = np.zeros((row_count, neighbor_k), dtype=np.float32)
-    receiver_delta = np.zeros((row_count, neighbor_k), dtype=np.float32)
-    labels = frame[TARGET].to_numpy(dtype=np.float32, copy=False)
-    timestamps = frame["_timestamp"].to_numpy(dtype=np.int64, copy=False)
-
-    for row_index, row in enumerate(frame.itertuples(index=False, name=None)):
+    for row in frame.itertuples(index=False, name=None):
         timestamp = int(row[timestamp_index])
         sender = store.get_id(str(row[sender_index]))
         receiver = store.get_id(str(row[receiver_index]))
-        _pad_history(
-            store.history(sender, timestamp, neighbor_k),
-            sender_features[row_index, 1:],
-            sender_delta[row_index],
-            timestamp,
+        sender_events, sender_times = _pad_history(
+            store.history(sender, timestamp, neighbor_k), neighbor_k, len(ALL_FEATURES), timestamp
         )
-        _pad_history(
-            store.history(receiver, timestamp, neighbor_k),
-            receiver_features[row_index, 1:],
-            receiver_delta[row_index],
-            timestamp,
+        receiver_events, receiver_times = _pad_history(
+            store.history(receiver, timestamp, neighbor_k), neighbor_k, len(ALL_FEATURES), timestamp
         )
+        transaction = np.asarray([row[index] for index in feature_indices], dtype=np.float64)
+        if feature_scaler is not None:
+            transaction = feature_scaler.transform_array(transaction)
+        else:
+            transaction = transaction.astype(np.float32)
+        transaction_features.append(transaction)
+        sender_features.append(np.vstack([np.zeros(len(ALL_FEATURES), dtype=np.float32), sender_events]))
+        receiver_features.append(np.vstack([np.zeros(len(ALL_FEATURES), dtype=np.float32), receiver_events]))
+        sender_delta.append(sender_times)
+        receiver_delta.append(receiver_times)
+        labels.append(int(row[target_index]))
+        timestamps.append(timestamp)
 
     return TemporalBatch(
-        transaction_features=torch.from_numpy(transaction_matrix),
-        sender_features=torch.from_numpy(sender_features),
-        sender_delta_seconds=torch.from_numpy(sender_delta),
-        receiver_features=torch.from_numpy(receiver_features),
-        receiver_delta_seconds=torch.from_numpy(receiver_delta),
-        labels=torch.from_numpy(labels),
-        timestamps=torch.from_numpy(timestamps),
+        transaction_features=torch.from_numpy(np.stack(transaction_features)),
+        sender_features=torch.from_numpy(np.stack(sender_features)),
+        sender_delta_seconds=torch.from_numpy(np.stack(sender_delta)),
+        receiver_features=torch.from_numpy(np.stack(receiver_features)),
+        receiver_delta_seconds=torch.from_numpy(np.stack(receiver_delta)),
+        labels=torch.tensor(labels, dtype=torch.float32),
+        timestamps=torch.tensor(timestamps, dtype=torch.long),
     )
 
 
