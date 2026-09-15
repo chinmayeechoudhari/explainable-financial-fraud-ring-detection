@@ -57,7 +57,7 @@ class EventFeatureStore:
             timestamp,
             source,
             destination,
-            (row[index] for index in feature_indices[2:]),
+            tuple(row[index] for index in feature_indices[2:]),
         )
 
     def history(self, node_id: int, timestamp: int, limit: int) -> list[tuple[int, np.ndarray]]:
