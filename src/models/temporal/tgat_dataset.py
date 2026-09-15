@@ -50,7 +50,7 @@ class EventFeatureStore:
         return self.account_to_id[account]
 
     def add_row(self, row, timestamp: int, feature_indices: tuple[int, ...]) -> None:
-        """Insert one tuple/array row without constructing pandas objects."""
+        """Insert one itertuples row without constructing pandas objects."""
         source = self.get_id(str(row[feature_indices[0]]))
         destination = self.get_id(str(row[feature_indices[1]]))
         self.store.add_event(
@@ -80,7 +80,7 @@ def _pad_history(events: Iterable[tuple[int, np.ndarray]], k: int, feature_dim: 
 
 
 def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int = 10, feature_scaler=None) -> TemporalBatch:
-    """Build a causal batch using one NumPy conversion per batch."""
+    """Build a causal batch using tuple-based row access."""
     columns = list(frame.columns)
     idx = {name: pos for pos, name in enumerate(columns)}
     feature_indices = tuple(idx[name] for name in ALL_FEATURES)
@@ -88,15 +88,10 @@ def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int =
     receiver_index = idx["To Account"]
     timestamp_index = idx["_timestamp"]
     target_index = idx[TARGET]
-
-    # Arrow-backed Pandas scalar access is disproportionately expensive for this
-    # chronological hot loop. Convert the batch once, then use plain ndarray
-    # indexing for every transaction. This does not alter values or ordering.
-    rows = frame.to_numpy(copy=False)
     transaction_features, sender_features, sender_delta = [], [], []
     receiver_features, receiver_delta, labels, timestamps = [], [], [], []
 
-    for row in rows:
+    for row in frame.itertuples(index=False, name=None):
         timestamp = int(row[timestamp_index])
         sender = store.get_id(str(row[sender_index]))
         receiver = store.get_id(str(row[receiver_index]))
