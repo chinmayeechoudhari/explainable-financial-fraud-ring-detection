@@ -45,7 +45,7 @@ class TemporalNeighborStore:
             timestamp=int(timestamp),
             source=int(source),
             destination=int(destination),
-            features=tuple(features),
+            features=tuple(float(v) for v in features),
         )
         outgoing = self._outgoing[event.source]
         outgoing_timestamps = self._outgoing_timestamps[event.source]
@@ -71,7 +71,12 @@ class TemporalNeighborStore:
         query_timestamp: int,
         limit: int,
     ) -> list[TemporalEvent]:
-        """Return up to limit most-recent events with timestamp < query."""
+        """Return up to limit most-recent events with timestamp < query.
+
+        Binary search identifies the last eligible position. This avoids
+        scanning recent events that are at the query timestamp, which is common
+        in this dataset because many transactions share exact timestamps.
+        """
         if not history:
             return []
         eligible_end = bisect_left(timestamps, int(query_timestamp))
