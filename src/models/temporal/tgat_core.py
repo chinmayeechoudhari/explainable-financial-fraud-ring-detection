@@ -40,6 +40,7 @@ class TemporalAttentionLayer(nn.Module):
         time_dim: int,
         num_heads: int = 2,
         dropout: float = 0.2,
+        use_time_encoding: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -47,6 +48,7 @@ class TemporalAttentionLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.use_time_encoding = use_time_encoding
         self.query = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.key = nn.Linear(hidden_dim + time_dim, hidden_dim, bias=False)
         self.value = nn.Linear(hidden_dim + time_dim, hidden_dim, bias=False)
@@ -62,15 +64,6 @@ class TemporalAttentionLayer(nn.Module):
         time_encoder: TimeEncoder,
         return_attention: bool = False,
     ) -> tuple[Tensor, Optional[Tensor]]:
-        """
-        query_state: [B, H]
-        neighbor_states: [B, K, H]
-        delta_seconds: [B, K]
-
-        A non-positive delta denotes padding. Padding receives exactly zero
-        attention, which prevents artificial neighbors from affecting the
-        representation.
-        """
         if neighbor_states.dim() != 3:
             raise ValueError("neighbor_states must have shape [B, K, H]")
         if delta_seconds.shape[:2] != neighbor_states.shape[:2]:
@@ -78,11 +71,23 @@ class TemporalAttentionLayer(nn.Module):
 
         batch_size, neighbor_count, _ = neighbor_states.shape
         valid = delta_seconds > 0
-        time_features = time_encoder(delta_seconds.reshape(-1)).reshape(
-            batch_size, neighbor_count, -1
-        )
-        combined = torch.cat([neighbor_states, time_features], dim=-1)
 
+        if self.use_time_encoding:
+            time_features = time_encoder(delta_seconds.reshape(-1)).reshape(
+                batch_size, neighbor_count, -1
+            )
+        else:
+            # Keep the validity mask based on the real delta, but remove the
+            # temporal information supplied to key/value projections.
+            time_features = torch.zeros(
+                batch_size,
+                neighbor_count,
+                time_encoder.dimension,
+                dtype=neighbor_states.dtype,
+                device=neighbor_states.device,
+            )
+
+        combined = torch.cat([neighbor_states, time_features], dim=-1)
         q = self.query(query_state).view(batch_size, self.num_heads, self.head_dim)
         k = self.key(combined).view(
             batch_size, neighbor_count, self.num_heads, self.head_dim
@@ -92,7 +97,9 @@ class TemporalAttentionLayer(nn.Module):
         ).transpose(1, 2)
 
         logits = (q.unsqueeze(2) * k).sum(dim=-1) / math.sqrt(self.head_dim)
-        logits = logits.masked_fill(~valid.unsqueeze(1), torch.finfo(logits.dtype).min)
+        logits = logits.masked_fill(
+            ~valid.unsqueeze(1), torch.finfo(logits.dtype).min
+        )
         weights = torch.softmax(logits, dim=-1)
         weights = weights * valid.unsqueeze(1).to(weights.dtype)
         normalizer = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -108,7 +115,7 @@ class TemporalAttentionLayer(nn.Module):
 
 
 class TGATTransactionModel(nn.Module):
-    """Two-layer TGAT-style account encoder with transaction classifier."""
+    """TGAT-style account encoder with configurable ablation architecture."""
 
     def __init__(
         self,
@@ -118,21 +125,32 @@ class TGATTransactionModel(nn.Module):
         time_dim: int = 16,
         num_heads: int = 2,
         dropout: float = 0.2,
+        num_layers: int = 2,
+        use_time_encoding: bool = True,
     ) -> None:
         super().__init__()
+        if num_layers not in (1, 2):
+            raise ValueError("num_layers must be 1 or 2")
         self.transaction_dim = transaction_dim
         self.event_dim = event_dim
         self.hidden_dim = hidden_dim
         self.time_dim = time_dim
         self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.use_time_encoding = use_time_encoding
+
         self.node_encoder = nn.Sequential(
             nn.Linear(event_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
         self.time_encoder = TimeEncoder(time_dim)
-        self.attn1 = TemporalAttentionLayer(hidden_dim, time_dim, num_heads, dropout)
-        self.attn2 = TemporalAttentionLayer(hidden_dim, time_dim, num_heads, dropout)
+        self.attn1 = TemporalAttentionLayer(
+            hidden_dim, time_dim, num_heads, dropout, use_time_encoding
+        )
+        self.attn2 = TemporalAttentionLayer(
+            hidden_dim, time_dim, num_heads, dropout, use_time_encoding
+        )
         self.transaction_encoder = nn.Sequential(
             nn.Linear(hidden_dim * 2 + transaction_dim, hidden_dim),
             nn.ReLU(),
@@ -154,9 +172,13 @@ class TGATTransactionModel(nn.Module):
         query, attn1 = self.attn1(
             query, neighbors, delta_seconds, self.time_encoder, return_attention
         )
-        query, attn2 = self.attn2(
-            query, neighbors, delta_seconds, self.time_encoder, return_attention
-        )
+        if self.num_layers == 2:
+            query, attn2 = self.attn2(
+                query, neighbors, delta_seconds, self.time_encoder, return_attention
+            )
+        else:
+            attn2 = None
+
         if return_attention:
             return query, [attn1, attn2]
         return query, None
@@ -171,18 +193,23 @@ class TGATTransactionModel(nn.Module):
         return_attention: bool = False,
     ) -> tuple[Tensor, Optional[dict[str, list[Tensor]]]]:
         sender_embedding, sender_attention = self.encode_account(
-            sender_features[:, 0, :], sender_features[:, 1:, :],
-            sender_delta_seconds, return_attention
+            sender_features[:, 0, :],
+            sender_features[:, 1:, :],
+            sender_delta_seconds,
+            return_attention,
         )
         receiver_embedding, receiver_attention = self.encode_account(
-            receiver_features[:, 0, :], receiver_features[:, 1:, :],
-            receiver_delta_seconds, return_attention
+            receiver_features[:, 0, :],
+            receiver_features[:, 1:, :],
+            receiver_delta_seconds,
+            return_attention,
         )
         combined = torch.cat(
             [sender_embedding, receiver_embedding, transaction_features], dim=-1
         )
         representation = self.transaction_encoder(combined)
         logits = self.classifier(representation).squeeze(-1)
+
         if return_attention:
             return logits, {
                 "sender": sender_attention or [],
