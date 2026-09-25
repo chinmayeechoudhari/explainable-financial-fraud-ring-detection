@@ -58,3 +58,46 @@ def test_no_neighbor_batch_has_zero_valid_deltas():
     assert batch.transaction_features.shape == (1, len(CURRENT_FEATURES))
     assert float(batch.sender_delta_seconds.sum()) == 0.0
     assert float(batch.receiver_delta_seconds.sum()) == 0.0
+
+
+def test_same_timestamp_micro_batches_share_pre_state():
+    import pandas as pd
+    from src.models.temporal.tgat_dataset import ALL_FEATURES, EventFeatureStore
+    from src.models.temporal.train_tgat import make_batches
+
+    rows = []
+    for i in range(5):
+        row = {
+            "From Account": "A",
+            "To Account": "B",
+            "_timestamp": 100,
+            "Is Laundering": 0,
+        }
+        for name in ALL_FEATURES:
+            row[name] = 0.0
+        rows.append(row)
+
+    frame = pd.DataFrame(rows)
+    store = EventFeatureStore(max_history=10)
+    batches = make_batches(frame, store, batch_size=2, neighbor_k=2)
+
+    first = next(batches)
+    second = next(batches)
+    third = next(batches)
+
+    assert float(first.sender_delta_seconds.sum()) == 0.0
+    assert float(second.sender_delta_seconds.sum()) == 0.0
+    assert float(third.sender_delta_seconds.sum()) == 0.0
+
+    # The generator has not resumed past the timestamp group yet, so no
+    # transaction at T=100 may have entered history.
+    assert store.store.recent_events(store.get_id("A"), 101, 10) == []
+
+    with_new_timestamp = pd.DataFrame([{
+        **{"From Account": "A", "To Account": "C", "_timestamp": 101, "Is Laundering": 0},
+        **{name: 0.0 for name in ALL_FEATURES},
+    }])
+    next_batches = make_batches(with_new_timestamp, store, batch_size=2, neighbor_k=2)
+    next_batch = next(next_batches)
+
+    assert float(next_batch.sender_delta_seconds[0].sum()) > 0.0
