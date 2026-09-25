@@ -36,6 +36,13 @@ def main() -> None:
     test = read_frame(args.data_dir / "test.csv")
     future = read_frame(args.data_dir / "future.csv")
 
+    shift_columns = [
+        "Amount Received", "Amount Paid", "Amount Difference", "Amount Ratio",
+        "Same Bank Transaction", "Cross Bank Transaction", "Is Weekend",
+    ]
+    train_shift_stats = train[shift_columns].agg(["mean", "std"])
+    future_shift_stats = future[shift_columns].agg(["mean", "std"])
+
     scaler = TemporalFeatureScaler.fit(train)
     train = scaler.transform_frame(train)
     validation = scaler.transform_frame(validation)
@@ -73,6 +80,23 @@ def main() -> None:
     metrics["threshold_source"] = str(args.threshold_file)
     metrics["model_source"] = str(args.checkpoint)
 
+    shift_rows = []
+    for column in shift_columns:
+        train_mean = float(train_shift_stats.loc["mean", column])
+        train_std = float(train_shift_stats.loc["std", column])
+        future_mean = float(future_shift_stats.loc["mean", column])
+        future_std = float(future_shift_stats.loc["std", column])
+        pooled_scale = max(abs(train_std), 1e-12)
+        shift_rows.append({
+            "feature": column,
+            "train_mean": train_mean,
+            "future_mean": future_mean,
+            "train_std": train_std,
+            "future_std": future_std,
+            "mean_shift_in_train_sd": (future_mean - train_mean) / pooled_scale,
+        })
+    shift_table = pd.DataFrame(shift_rows)
+
     out = args.results_dir
     out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({
@@ -81,6 +105,7 @@ def main() -> None:
         "score": future_scores,
         "prediction": (future_scores >= threshold).astype(np.int8),
     }).to_csv(out / "future_predictions.csv", index=False)
+    shift_table.to_csv(out / "distribution_shift.csv", index=False)
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (out / "config.json").write_text(json.dumps({
         "checkpoint": str(args.checkpoint),
