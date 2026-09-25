@@ -79,11 +79,12 @@ def _pad_history(events: Iterable[tuple[int, np.ndarray]], k: int, feature_dim: 
     return feature_array, delta_array
 
 
-def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int = 10, feature_scaler=None) -> TemporalBatch:
+def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int = 10, feature_scaler=None, active_features: list[str] | None = None, use_neighbors: bool = True) -> TemporalBatch:
     """Build a causal batch using tuple-based row access."""
     columns = list(frame.columns)
     idx = {name: pos for pos, name in enumerate(columns)}
-    feature_indices = tuple(idx[name] for name in ALL_FEATURES)
+    active_features = list(active_features or ALL_FEATURES)
+    feature_indices = tuple(idx[name] for name in active_features)
     sender_index = idx["From Account"]
     receiver_index = idx["To Account"]
     timestamp_index = idx["_timestamp"]
@@ -95,20 +96,26 @@ def build_batch(frame: pd.DataFrame, store: EventFeatureStore, neighbor_k: int =
         timestamp = int(row[timestamp_index])
         sender = store.get_id(str(row[sender_index]))
         receiver = store.get_id(str(row[receiver_index]))
-        sender_events, sender_times = _pad_history(
-            store.history(sender, timestamp, neighbor_k), neighbor_k, len(ALL_FEATURES), timestamp
-        )
-        receiver_events, receiver_times = _pad_history(
-            store.history(receiver, timestamp, neighbor_k), neighbor_k, len(ALL_FEATURES), timestamp
-        )
+        if use_neighbors:
+            sender_events, sender_times = _pad_history(
+                store.history(sender, timestamp, neighbor_k), neighbor_k, len(active_features), timestamp
+            )
+            receiver_events, receiver_times = _pad_history(
+                store.history(receiver, timestamp, neighbor_k), neighbor_k, len(active_features), timestamp
+            )
+        else:
+            sender_events = np.zeros((neighbor_k, len(active_features)), dtype=np.float32)
+            receiver_events = np.zeros((neighbor_k, len(active_features)), dtype=np.float32)
+            sender_times = np.zeros(neighbor_k, dtype=np.float32)
+            receiver_times = np.zeros(neighbor_k, dtype=np.float32)
         transaction = np.asarray([row[index] for index in feature_indices], dtype=np.float64)
         if feature_scaler is not None:
             transaction = feature_scaler.transform_array(transaction)
         else:
             transaction = transaction.astype(np.float32)
         transaction_features.append(transaction)
-        sender_features.append(np.vstack([np.zeros(len(ALL_FEATURES), dtype=np.float32), sender_events]))
-        receiver_features.append(np.vstack([np.zeros(len(ALL_FEATURES), dtype=np.float32), receiver_events]))
+        sender_features.append(np.vstack([np.zeros(len(active_features), dtype=np.float32), sender_events]))
+        receiver_features.append(np.vstack([np.zeros(len(active_features), dtype=np.float32), receiver_events]))
         sender_delta.append(sender_times)
         receiver_delta.append(receiver_times)
         labels.append(int(row[target_index]))
