@@ -318,7 +318,7 @@ def main() -> None:
     (args.results_dir / "training_log.json").write_text(json.dumps(log, indent=2), encoding="utf-8")
 
     print("\nRebuilding train history for final validation/test evaluation...", flush=True)
-    evaluation_store = EventFeatureStore(max_history=args.neighbor_k)
+    evaluation_store = EventFeatureStore(max_history=max_history)
     history_start = time.time()
     history_batches = populate_history(train, evaluation_store, args.batch_size, active_features)
     print(
@@ -328,7 +328,7 @@ def main() -> None:
     )
     print("Evaluating validation...", flush=True)
     val_labels, val_scores, val_ts = predict(
-        model, validation, evaluation_store, args.batch_size, args.neighbor_k, device
+        model, validation, evaluation_store, args.batch_size, args.neighbor_k, device, active_features, use_neighbors
     )
     print("Evaluating test...", flush=True)
     test_labels, test_scores, test_ts = predict(
@@ -339,7 +339,7 @@ def main() -> None:
         "validation": evaluate(val_labels, val_scores),
         "test": evaluate(test_labels, test_scores),
         "training_seconds": time.time() - start_time,
-        "feature_count": len(ALL_FEATURES),
+        "feature_count": len(active_features),
         "neighbor_k": args.neighbor_k,
         "ablation": args.ablation,
         "negative_sampling_ratio": args.negative_ratio,
