@@ -91,7 +91,7 @@ def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int,
         start = end
 
 
-def populate_history(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int) -> int:
+def populate_history(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, active_features=None) -> int:
     """Rebuild causal history without running the TGAT model.
 
     The previous final-evaluation path called ``predict(train, ...)`` only to
@@ -101,7 +101,7 @@ def populate_history(frame: pd.DataFrame, store: EventFeatureStore, batch_size: 
     construction, and score generation for the training split.
     """
     start = 0
-    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame)
+    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame, active_features or ALL_FEATURES)
     batches = 0
     while start < len(frame):
         end = min(start + batch_size, len(frame))
@@ -320,7 +320,7 @@ def main() -> None:
     print("\nRebuilding train history for final validation/test evaluation...", flush=True)
     evaluation_store = EventFeatureStore(max_history=args.neighbor_k)
     history_start = time.time()
-    history_batches = populate_history(train, evaluation_store, args.batch_size)
+    history_batches = populate_history(train, evaluation_store, args.batch_size, active_features)
     print(
         f"Train history rebuilt: {len(train):,} rows, "
         f"{history_batches} batches, time={time.time() - history_start:.1f}s",
