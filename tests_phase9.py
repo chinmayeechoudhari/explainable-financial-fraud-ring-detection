@@ -93,11 +93,28 @@ def test_same_timestamp_micro_batches_share_pre_state():
     # transaction at T=100 may have entered history.
     assert store.store.recent_events(store.get_id("A"), 101, 10) == []
 
+    # Resume the generator so the complete timestamp-100 group is inserted
+    # into history before evaluating a later timestamp.
+    try:
+        next(batches)
+    except StopIteration:
+        pass
+
     with_new_timestamp = pd.DataFrame([{
-        **{"From Account": "A", "To Account": "C", "_timestamp": 101, "Is Laundering": 0},
+        **{
+            "From Account": "A",
+            "To Account": "C",
+            "_timestamp": 101,
+            "Is Laundering": 0,
+        },
         **{name: 0.0 for name in ALL_FEATURES},
     }])
-    next_batches = make_batches(with_new_timestamp, store, batch_size=2, neighbor_k=2)
+    next_batches = make_batches(
+        with_new_timestamp,
+        store,
+        batch_size=2,
+        neighbor_k=2,
+    )
     next_batch = next(next_batches)
 
     assert float(next_batch.sender_delta_seconds[0].sum()) > 0.0
