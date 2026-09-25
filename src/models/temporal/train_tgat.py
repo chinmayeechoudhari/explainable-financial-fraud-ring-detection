@@ -40,7 +40,7 @@ def read_frame(path: Path, rows: int | None = None) -> pd.DataFrame:
     return frame
 
 
-def _row_layout(frame: pd.DataFrame) -> tuple[int, int, int, tuple[int, ...]]:
+def _row_layout(frame: pd.DataFrame, active_features=None) -> tuple[int, int, int, tuple[int, ...]]:
     """Cache the positional layout used by chronological row processing."""
     columns = list(frame.columns)
     idx = {name: pos for pos, name in enumerate(columns)}
@@ -48,7 +48,7 @@ def _row_layout(frame: pd.DataFrame) -> tuple[int, int, int, tuple[int, ...]]:
         idx["From Account"],
         idx["To Account"],
         idx["_timestamp"],
-        tuple(idx[name] for name in ALL_FEATURES),
+        tuple(idx[name] for name in (active_features or ALL_FEATURES)),
     )
 
 
@@ -70,10 +70,10 @@ def _add_chunk_to_store(
         )
 
 
-def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, neighbor_k: int):
+def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, neighbor_k: int, active_features=None, use_neighbors=True):
     """Yield causal batches and update history only after each timestamp-safe batch."""
     start = 0
-    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame)
+    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame, active_features or ALL_FEATURES)
     while start < len(frame):
         end = min(start + batch_size, len(frame))
         if end < len(frame):
@@ -84,7 +84,7 @@ def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int,
         # Frames are already transformed by the train-only scaler. Passing the
         # scaler again here would double-transform query features while stored
         # event features remain single-transformed.
-        yield build_batch(chunk, store, neighbor_k, feature_scaler=None)
+        yield build_batch(chunk, store, neighbor_k, feature_scaler=None, active_features=active_features, use_neighbors=use_neighbors)
         _add_chunk_to_store(
             chunk, store, source_idx, destination_idx, timestamp_idx, feature_indices
         )
@@ -118,14 +118,14 @@ def populate_history(frame: pd.DataFrame, store: EventFeatureStore, batch_size: 
     return batches
 
 
-def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_k, negative_ratio, device):
+def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_k, negative_ratio, device, active_features=None, use_neighbors=True):
     model.train()
     total_loss = 0.0
     used = 0
     positives = 0
     negatives = 0
     total_batches = 0
-    for batch in make_batches(frame, store, batch_size, neighbor_k):
+    for batch in make_batches(frame, store, batch_size, neighbor_k, active_features, use_neighbors):
         total_batches += 1
         labels = batch.labels
         positive_idx = torch.nonzero(labels == 1, as_tuple=False).flatten()
@@ -162,13 +162,13 @@ def train_epoch(model, frame, store, optimizer, criterion, batch_size, neighbor_
     return total_loss / max(used, 1), positives, negatives, total_batches
 
 
-def predict(model, frame, store, batch_size, neighbor_k, device):
+def predict(model, frame, store, batch_size, neighbor_k, device, active_features=None, use_neighbors=True):
     model.eval()
     scores = []
     labels = []
     timestamps = []
     with torch.no_grad():
-        for batch in make_batches(frame, store, batch_size, neighbor_k):
+        for batch in make_batches(frame, store, batch_size, neighbor_k, active_features, use_neighbors):
             output = model(
                 batch.transaction_features.to(device),
                 batch.sender_features.to(device),
@@ -200,7 +200,21 @@ def main() -> None:
     parser.add_argument("--max-validation-rows", type=int, default=None)
     parser.add_argument("--max-test-rows", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--ablation", choices=["none","no_temporal_features","no_neighbors","no_time_encoding"], default="none")
+    parser.add_argument("--max-history", type=int, default=None)
+    parser.add_argument("--hidden-dim", type=int, default=32)
+    parser.add_argument("--num-heads", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, choices=[1,2], default=2)
+    parser.add_argument("--dropout", type=float, default=0.2)
     args = parser.parse_args()
+
+    if args.ablation == "no_temporal_features":
+        active_features = list(CURRENT_FEATURES)
+    else:
+        active_features = list(ALL_FEATURES)
+    use_neighbors = args.ablation != "no_neighbors"
+    use_time_encoding = args.ablation != "no_time_encoding"
+    max_history = args.max_history if args.max_history is not None else args.neighbor_k
 
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,12 +243,14 @@ def main() -> None:
     print("Feature scaling: train-only mean/std, clipped to [-10, 10]", flush=True)
 
     model = TGATTransactionModel(
-        transaction_dim=len(ALL_FEATURES),
-        event_dim=len(ALL_FEATURES),
-        hidden_dim=32,
+        transaction_dim=len(active_features),
+        event_dim=len(active_features),
+        hidden_dim=args.hidden_dim,
         time_dim=16,
-        num_heads=2,
-        dropout=0.2,
+        num_heads=args.num_heads,
+        dropout=args.dropout,
+        num_layers=args.num_layers,
+        use_time_encoding=use_time_encoding,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -243,7 +259,16 @@ def main() -> None:
     config = vars(args).copy()
     config.update({
         "device": str(device),
-        "feature_count": len(ALL_FEATURES),
+        "feature_count": len(active_features),
+        "active_features": active_features,
+        "ablation": args.ablation,
+        "use_neighbors": use_neighbors,
+        "use_time_encoding": use_time_encoding,
+        "max_history": max_history,
+        "hidden_dim": args.hidden_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
         "current_feature_count": len(CURRENT_FEATURES),
         "temporal_feature_count": len(ALL_FEATURES) - len(CURRENT_FEATURES),
         "feature_scaling": "train_only_mean_std_clip_10",
@@ -255,16 +280,16 @@ def main() -> None:
     log = []
     start_time = time.time()
     for epoch in range(1, args.epochs + 1):
-        store = EventFeatureStore(max_history=args.neighbor_k)
+        store = EventFeatureStore(max_history=max_history)
         epoch_start = time.time()
         print(f"\nEpoch {epoch}/{args.epochs} - training...", flush=True)
         loss, positives, negatives, batches = train_epoch(
             model, train, store, optimizer, criterion,
-            args.batch_size, args.neighbor_k, args.negative_ratio, device,
+            args.batch_size, args.neighbor_k, args.negative_ratio, device, active_features, use_neighbors,
         )
         print(f"Epoch {epoch}/{args.epochs} - validating...", flush=True)
         val_labels, val_scores, _ = predict(
-            model, validation, store, args.batch_size, args.neighbor_k, device
+            model, validation, store, args.batch_size, args.neighbor_k, device, active_features, use_neighbors
         )
         val_pr = average_precision_score(val_labels, val_scores)
         row = {
@@ -307,7 +332,7 @@ def main() -> None:
     )
     print("Evaluating test...", flush=True)
     test_labels, test_scores, test_ts = predict(
-        model, test, evaluation_store, args.batch_size, args.neighbor_k, device
+        model, test, evaluation_store, args.batch_size, args.neighbor_k, device, active_features, use_neighbors
     )
 
     metrics = {
@@ -316,6 +341,7 @@ def main() -> None:
         "training_seconds": time.time() - start_time,
         "feature_count": len(ALL_FEATURES),
         "neighbor_k": args.neighbor_k,
+        "ablation": args.ablation,
         "negative_sampling_ratio": args.negative_ratio,
         "device": str(device),
         "feature_scaling": "train_only_mean_std_clip_10",
