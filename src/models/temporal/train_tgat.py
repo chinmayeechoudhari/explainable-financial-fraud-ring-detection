@@ -71,24 +71,46 @@ def _add_chunk_to_store(
 
 
 def make_batches(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, neighbor_k: int, active_features=None, use_neighbors=True):
-    """Yield causal batches and update history only after each timestamp-safe batch."""
+    """Yield causal micro-batches without exposing same-timestamp events.
+
+    Timestamp groups are the causal state boundary, while batch_size is the
+    computational batch size. Every micro-batch from timestamp T is built
+    against the same pre-T history. The complete timestamp group is inserted
+    into history only after its final micro-batch has been yielded.
+    """
     start = 0
-    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(frame, active_features or ALL_FEATURES)
+    source_idx, destination_idx, timestamp_idx, feature_indices = _row_layout(
+        frame, active_features or ALL_FEATURES
+    )
     while start < len(frame):
-        end = min(start + batch_size, len(frame))
-        if end < len(frame):
-            timestamp = frame.iloc[end - 1]["_timestamp"]
-            while end < len(frame) and frame.iloc[end]["_timestamp"] == timestamp:
-                end += 1
-        chunk = frame.iloc[start:end]
+        group_timestamp = int(frame.iloc[start]["_timestamp"])
+        group_end = start + 1
+        while group_end < len(frame) and int(frame.iloc[group_end]["_timestamp"]) == group_timestamp:
+            group_end += 1
+
+        group = frame.iloc[start:group_end]
+
         # Frames are already transformed by the train-only scaler. Passing the
         # scaler again here would double-transform query features while stored
         # event features remain single-transformed.
-        yield build_batch(chunk, store, neighbor_k, feature_scaler=None, active_features=active_features, use_neighbors=use_neighbors)
+        for micro_start in range(0, len(group), batch_size):
+            micro_end = min(micro_start + batch_size, len(group))
+            chunk = group.iloc[micro_start:micro_end]
+            yield build_batch(
+                chunk,
+                store,
+                neighbor_k,
+                feature_scaler=None,
+                active_features=active_features,
+                use_neighbors=use_neighbors,
+            )
+
+        # Crucial causal boundary: no event at group_timestamp is visible to
+        # any other query at the same timestamp.
         _add_chunk_to_store(
-            chunk, store, source_idx, destination_idx, timestamp_idx, feature_indices
+            group, store, source_idx, destination_idx, timestamp_idx, feature_indices
         )
-        start = end
+        start = group_end
 
 
 def populate_history(frame: pd.DataFrame, store: EventFeatureStore, batch_size: int, active_features=None) -> int:
